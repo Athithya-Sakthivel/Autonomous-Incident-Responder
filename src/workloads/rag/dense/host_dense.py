@@ -22,19 +22,26 @@ from fastembed import TextEmbedding
 from pydantic import BaseModel
 
 # ─── Configuration ─────────────────────────────────────────────────
-LOG_LEVEL: str = os.getenv("OTEL_LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")).upper()
+# Normalise LOG_LEVEL so it is always a valid Python logging level name
+_RAW_LEVEL = os.getenv("OTEL_LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")).upper()
+_LEVEL_MAP = {"WARN": "WARNING", "EXCEPTION": "ERROR"}
+LOG_LEVEL = _LEVEL_MAP.get(_RAW_LEVEL, _RAW_LEVEL)
+if LOG_LEVEL not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+    LOG_LEVEL = "INFO"
+
+# Uvicorn expects lowercase log level, Python logging expects uppercase
+LOG_LEVEL_NAME = LOG_LEVEL.upper()      # e.g. WARNING
+UVICORN_LOG_LEVEL = LOG_LEVEL.lower()   # e.g. warning
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(logging, LOG_LEVEL_NAME, logging.INFO),
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     stream=sys.stderr,
 )
 log = logging.getLogger("dense-embedder")
 
 # ── Silence noisy loggers ─────────────────────────────────────────
-# uvicorn.access logs every health‑check probe → hundreds of lines/min
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-# httpx / httpcore DEBUG logs flood stderr when instrumented
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -144,7 +151,7 @@ def _init_otel() -> None:
         noop = _NoOpMetric()
         request_counter = request_duration = requests_in_progress = error_counter = noop
 
-    # Logs — LoggingHandler + LoggingInstrumentor keeps it alive across uvicorn restarts
+    # Logs
     try:
         _logger_provider = LoggerProvider(resource=resource)
         _logger_provider.add_log_record_processor(
@@ -356,7 +363,7 @@ if __name__ == "__main__":
         "host_dense:app",
         host=os.getenv("DENSE_HOST", "0.0.0.0"),
         port=int(os.getenv("DENSE_PORT", "8200")),
-        log_level=LOG_LEVEL.lower(),
+        log_level=UVICORN_LOG_LEVEL,   # ← fixed: uses normalised lowercase level
         log_config=None,
         loop="uvloop",
         http="httptools",
