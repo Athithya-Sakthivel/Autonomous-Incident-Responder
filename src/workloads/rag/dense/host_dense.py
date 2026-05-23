@@ -1,7 +1,17 @@
 """Dense embedding service with OpenTelemetry (traces, metrics, logs).
 
-OTel providers are initialized inside the startup event (after uvicorn configures its logging).
-Traces are created only when tracer is available; metrics use a no-op fallback.
+OTel providers are initialized inside the startup event (after uvicorn
+configures its logging). Traces are created only when tracer is
+available; metrics use a no-op fallback.
+
+TRACE CONTEXT PROPAGATION
+-------------------------
+Incoming traceparent / tracestate headers are explicitly extracted from
+the FastAPI Request object and passed to the tracer.  This ensures that
+the span created here becomes a *child* of whatever upstream service
+(retriever-minimal, frontend, …) called us.  Without this extraction
+the OTel SDK would see no parent context and create a new root span,
+breaking the distributed trace.
 """
 
 from __future__ import annotations
@@ -17,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastembed import TextEmbedding
 from pydantic import BaseModel
 
@@ -29,7 +39,7 @@ LOG_LEVEL = _LEVEL_MAP.get(_RAW_LEVEL, _RAW_LEVEL)
 if LOG_LEVEL not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
     LOG_LEVEL = "INFO"
 
-# Uvicorn expects lowercase log level, Python logging expects uppercase
+# Uvicorn expects lowercase, Python logging expects uppercase
 LOG_LEVEL_NAME = LOG_LEVEL.upper()      # e.g. WARNING
 UVICORN_LOG_LEVEL = LOG_LEVEL.lower()   # e.g. warning
 
@@ -44,6 +54,7 @@ log = logging.getLogger("dense-embedder")
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("filelock").setLevel(logging.WARNING)
 
 DENSE_MODEL_NAME: str = os.getenv("DENSE_MODEL_NAME", "BAAI/bge-small-en-v1.5")
 LOCAL_DENSE_MODEL_PATH: str | None = os.getenv("LOCAL_DENSE_MODEL_PATH") or (
@@ -82,8 +93,8 @@ error_counter: Any = None
 
 class _NoOpMetric:
     """Fallback for metrics when OTel is unavailable."""
-    def add(self, *args, **kwargs): pass
-    def record(self, *args, **kwargs): pass
+    def add(self, *args: Any, **kwargs: Any) -> None: pass
+    def record(self, *args: Any, **kwargs: Any) -> None: pass
 
 
 def _init_otel() -> None:
@@ -151,7 +162,7 @@ def _init_otel() -> None:
         noop = _NoOpMetric()
         request_counter = request_duration = requests_in_progress = error_counter = noop
 
-    # Logs
+    # Logs — LoggingHandler + LoggingInstrumentor keeps it alive across uvicorn restarts
     try:
         _logger_provider = LoggerProvider(resource=resource)
         _logger_provider.add_log_record_processor(
@@ -250,8 +261,36 @@ def _embed_sync(texts: list[str]) -> list[list[float]]:
     return results
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════════════════════════
+
 @app.post("/embed", response_model=EmbedResponse)
-async def embed(req: EmbedRequest) -> dict[str, Any]:
+async def embed(req: EmbedRequest, request: Request) -> dict[str, Any]:
+    """
+    Generate dense embeddings for input texts.
+
+    TRACE CONTEXT PROPAGATION
+    -------------------------
+    The incoming HTTP request may carry W3C trace context headers
+    (traceparent, tracestate) injected by an upstream service
+    (e.g. retriever-minimal).  We explicitly extract that context here
+    and pass it to the tracer so that the span created in this
+    endpoint becomes a **child** of the upstream span rather than a
+    new root.  This is how a single distributed trace links both
+    services together in SigNoz / Jaeger.
+
+    IMPORTANT: FastAPIInstrumentor (registered in the startup event)
+    also reads traceparent automatically and creates a SERVER span.
+    The explicit extraction below ensures that our *manual* span
+    ("POST /embed") is nested under that SERVER span, preserving the
+    full parent → child → grandchild relationship.
+    """
+    # ── Extract trace context from upstream caller ────────────────
+    from opentelemetry.propagate import extract
+
+    ctx = extract(dict(request.headers))
+
     if not req.texts:
         raise HTTPException(400, "'texts' must be a non-empty list")
     if len(req.texts) > DENSE_BATCH_SIZE:
@@ -269,7 +308,8 @@ async def embed(req: EmbedRequest) -> dict[str, Any]:
 
     try:
         if tracer is not None:
-            with tracer.start_as_current_span("POST /embed") as span:
+            # Use the extracted context so this span links to the parent
+            with tracer.start_as_current_span("POST /embed", context=ctx) as span:
                 span.set_attributes({
                     "batch.size": len(req.texts),
                     "model.name": DENSE_MODEL_NAME,
@@ -363,7 +403,7 @@ if __name__ == "__main__":
         "host_dense:app",
         host=os.getenv("DENSE_HOST", "0.0.0.0"),
         port=int(os.getenv("DENSE_PORT", "8200")),
-        log_level=UVICORN_LOG_LEVEL,   # ← fixed: uses normalised lowercase level
+        log_level=UVICORN_LOG_LEVEL,
         log_config=None,
         loop="uvloop",
         http="httptools",
