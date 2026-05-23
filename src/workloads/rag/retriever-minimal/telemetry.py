@@ -123,8 +123,6 @@ def init_otel() -> None:
                 OTLPSpanExporter(endpoint=endpoint, insecure=insecure)
             )
         )
-        # Set the GLOBAL provider so that FastAPIInstrumentor (called
-        # right after this) picks it up.
         trace.set_tracer_provider(_tracer_provider)
         tracer = trace.get_tracer(__name__)
         log.info("Traces initialized — endpoint=%s", endpoint)
@@ -151,8 +149,6 @@ def init_otel() -> None:
         metrics.set_meter_provider(_meter_provider)
         meter = metrics.get_meter(__name__)
 
-        # Populate the mutable namespace – all endpoint code that
-        # accesses `telemetry.metrics_.<name>` now sees real counters.
         metrics_.request_counter = meter.create_counter(
             "retrieve.requests", "1", "Total retrieve requests"
         )

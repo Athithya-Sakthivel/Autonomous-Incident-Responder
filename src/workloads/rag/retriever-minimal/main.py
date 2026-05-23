@@ -40,6 +40,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("retriever-minimal")
 
+# ── Silence noisy loggers ─────────────────────────────────────────
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # ─── Service configuration ────────────────────────────────────────
 DENSE_URL: str = os.getenv("DENSE_URL", "http://dense-svc:8200")
 QDRANT_URL: str = os.getenv("QDRANT_URL", "http://qdrant:6333")
@@ -88,13 +93,10 @@ _logger_provider.add_log_record_processor(
 )
 _logs.set_logger_provider(_logger_provider)
 
-# Attach the OTel handler to the root logger so ALL logs (including
-# uvicorn.access, httpx, etc.) are exported as OTLP log records.
 _handler = LoggingHandler(level=logging.NOTSET, logger_provider=_logger_provider)
 logging.getLogger().setLevel(logging.NOTSET)
 logging.getLogger().addHandler(_handler)
 
-# Protect the handler from uvicorn's internal logging reconfiguration.
 LoggingInstrumentor().instrument(set_logging_format=False)
 
 log.info("Logs initialised — endpoint=%s", _otel_endpoint)
@@ -127,17 +129,14 @@ class RetrieveResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def startup() -> None:
-    # Traces & metrics (logs already running since import time)
     telemetry.init_otel()
 
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
-    # Pass the real TracerProvider so middleware sees it immediately.
     FastAPIInstrumentor.instrument_app(
         app, tracer_provider=telemetry._tracer_provider
     )
-    # Instrument httpx so outbound calls to dense/qdrant get trace spans.
     HTTPXClientInstrumentor().instrument()
 
     log.info(
@@ -155,13 +154,11 @@ async def retrieve(req: RetrieveRequest) -> dict[str, Any]:
         raise HTTPException(400, "query must not be empty")
 
     labels = {"model": "dense"}
-    # Safe – metrics_ namespace always returns a usable object.
     telemetry.metrics_.requests_in_progress.add(1, labels)
     start = time.perf_counter()
     status = "success"
 
     try:
-        # Use a real span if the tracer is available; else no‑op.
         if telemetry.tracer is not None:
             span = telemetry.tracer.start_as_current_span("POST /retrieve")
         else:
@@ -175,10 +172,7 @@ async def retrieve(req: RetrieveRequest) -> dict[str, Any]:
                     {"query.length": len(req.query), "top_k": req.top_k}
                 )
 
-            # 1. Get embedding from dense service
             query_vector = await _embed_query(req.query)
-
-            # 2. Search Qdrant
             results = await store.search(query_vector, limit=req.top_k)
 
             if s is not None:
@@ -287,7 +281,7 @@ if __name__ == "__main__":
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8001")),
         log_level=LOG_LEVEL.lower(),
-        log_config=None,  # ← CRITICAL: prevent uvicorn dictConfig wipe
+        log_config=None,
         loop="uvloop",
         http="httptools",
     )

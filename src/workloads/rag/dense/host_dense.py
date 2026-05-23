@@ -31,6 +31,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("dense-embedder")
 
+# ── Silence noisy loggers ─────────────────────────────────────────
+# uvicorn.access logs every health‑check probe → hundreds of lines/min
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+# httpx / httpcore DEBUG logs flood stderr when instrumented
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 DENSE_MODEL_NAME: str = os.getenv("DENSE_MODEL_NAME", "BAAI/bge-small-en-v1.5")
 LOCAL_DENSE_MODEL_PATH: str | None = os.getenv("LOCAL_DENSE_MODEL_PATH") or (
     Path("/app/.resolved_model_path").read_text().strip()
@@ -81,6 +88,8 @@ def _init_otel() -> None:
     from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
     from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.logging.handler import LoggingHandler
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
     from opentelemetry.sdk._logs import LoggerProvider
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.metrics import MeterProvider
@@ -88,7 +97,6 @@ def _init_otel() -> None:
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.instrumentation.logging.handler import LoggingHandler
 
     resource = Resource.create({
         "service.name": OTEL_SERVICE_NAME,
@@ -136,7 +144,7 @@ def _init_otel() -> None:
         noop = _NoOpMetric()
         request_counter = request_duration = requests_in_progress = error_counter = noop
 
-    # Logs
+    # Logs — LoggingHandler + LoggingInstrumentor keeps it alive across uvicorn restarts
     try:
         _logger_provider = LoggerProvider(resource=resource)
         _logger_provider.add_log_record_processor(
@@ -145,8 +153,10 @@ def _init_otel() -> None:
             )
         )
         _logs.set_logger_provider(_logger_provider)
-        handler = LoggingHandler(level=logging.INFO, logger_provider=_logger_provider)
+        handler = LoggingHandler(level=logging.NOTSET, logger_provider=_logger_provider)
+        logging.getLogger().setLevel(logging.NOTSET)
         logging.getLogger().addHandler(handler)
+        LoggingInstrumentor().instrument(set_logging_format=False)
         log.info("Logs initialized")
     except Exception:
         log.exception("Logs initialization failed")
@@ -245,7 +255,6 @@ async def embed(req: EmbedRequest) -> dict[str, Any]:
     start = time.perf_counter()
     status = "success"
 
-    # Use proper context manager if tracer is available, else just execute
     async def _run() -> list[list[float]]:
         return await asyncio.get_running_loop().run_in_executor(
             _EMBED_EXECUTOR, _embed_sync, req.texts
@@ -312,10 +321,8 @@ def healthz() -> dict[str, str]:
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    # OTel initialization must happen AFTER uvicorn has configured its logging
     _init_otel()
 
-    # Instrument FastAPI now that the real TracerProvider is set
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     FastAPIInstrumentor.instrument_app(app, tracer_provider=_tracer_provider)
 
@@ -350,6 +357,7 @@ if __name__ == "__main__":
         host=os.getenv("DENSE_HOST", "0.0.0.0"),
         port=int(os.getenv("DENSE_PORT", "8200")),
         log_level=LOG_LEVEL.lower(),
+        log_config=None,
         loop="uvloop",
         http="httptools",
     )
