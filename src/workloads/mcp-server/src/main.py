@@ -1,21 +1,13 @@
 """
-MCP Context Server — entrypoint.
+MCP Server — entrypoint.
 
-Provides customer, order, and billing data tools to the agent-service
-via the MCP protocol over SSE transport.
-
+Exposes 10 tools to the agent-service via MCP over HTTP transport.
 Architecture:
     1. Configure OpenTelemetry BEFORE importing FastMCP.
     2. Use @lifespan decorator to manage the asyncpg connection pool.
     3. Tools access the pool through ctx.lifespan_context["pool"].
     4. record_metrics decorator wraps each tool for OTel metrics + logs.
     5. Custom routes (/healthz, /readyz) for Kubernetes probes.
-
-Testing:
-    fastmcp call http://localhost:8001/sse lookup_customer email=priya.sharma@email.com
-    fastmcp call http://localhost:8001/sse get_recent_orders user_id=a1b2c3d4-...
-    curl http://localhost:8001/healthz
-    curl http://localhost:8001/readyz
 """
 
 from __future__ import annotations
@@ -39,8 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("mcp-server")
 
 # Silence noisy third‑party loggers — only suppress specific loggers,
-# NOT the root logger.  Root stays at INFO so our application logs
-# are visible and get exported to OTel with Trace IDs.
+# NOT the root logger.
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -73,8 +64,6 @@ from config import settings
 
 # ═══════════════════════════════════════════════════════════════════
 # Module-level pool reference — set during lifespan startup.
-# Custom routes cannot access ctx.lifespan_context, so we store the
-# pool here so /readyz can verify database connectivity.
 # ═══════════════════════════════════════════════════════════════════
 _pool: _db.asyncpg.Pool | None = None
 
@@ -82,20 +71,6 @@ _pool: _db.asyncpg.Pool | None = None
 # ═══════════════════════════════════════════════════════════════════
 # 3.  Tool decorator — records OTel metrics + emits logs inside
 #     FastMCP's auto‑created span.
-#
-#     FastMCP 3.3.1 auto‑creates a span for every MCP tool call.
-#     This decorator wraps the actual tool function, so metrics
-#     and logs run INSIDE that span.  LoggingInstrumentor (set up
-#     in telemetry.py) automatically injects the span's trace_id
-#     and span_id into every log record emitted here.
-#
-#     Each decorated tool records:
-#       mcp_context.requests{status} += 1
-#       mcp_context.duration (histogram, seconds)
-#       mcp_context.errors += 1 (on exception)
-#     And emits:
-#       log.info("Tool call started: <name>")
-#       log.info("Tool call completed: <name>")
 # ═══════════════════════════════════════════════════════════════════
 
 def record_metrics(tool_name: str):
@@ -155,7 +130,7 @@ async def app_lifespan(server: FastMCP):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 5.  Create the FastMCP server and register all 8 tools
+# 5.  Create the FastMCP server and register all 10 tools
 # ═══════════════════════════════════════════════════════════════════
 
 mcp = FastMCP(
@@ -163,7 +138,7 @@ mcp = FastMCP(
     lifespan=app_lifespan,
 )
 
-# ── Context Tools ────────────────────────────────────────────────
+# ── Context Tools (Read) ──────────────────────────────────────────
 
 @mcp.tool(name="lookup_customer", description="Look up a customer by email or phone number")
 @record_metrics("lookup_customer")
@@ -192,21 +167,48 @@ async def get_order_details_tool(order_id: str, ctx: Context = None) -> dict | N
 async def check_refund_eligibility_tool(order_id: str, ctx: Context = None) -> dict:
     return await _tools.check_refund_eligibility(order_id=order_id, ctx=ctx)
 
-# ── Ops Tools ────────────────────────────────────────────────────
 
 @mcp.tool(name="search_policies", description="Search company policies using semantic search")
 @record_metrics("search_policies")
 async def search_policies_tool(query: str, top_k: int = 5, ctx: Context = None) -> list[dict]:
     return await _tools.search_policies(query=query, top_k=top_k, ctx=ctx)
 
+# ── Action Tools (Write) ──────────────────────────────────────────
+
+@mcp.tool(name="issue_wallet_credit", description="Issue wallet credit to a customer (max Rs.500)")
+@record_metrics("issue_wallet_credit")
+async def issue_wallet_credit_tool(
+    user_id: str, amount: float, reason: str, ctx: Context = None
+) -> dict:
+    return await _tools.issue_wallet_credit(user_id=user_id, amount=amount, reason=reason, ctx=ctx)
+
+
+@mcp.tool(name="schedule_return_pickup", description="Schedule a return pickup for an eligible order")
+@record_metrics("schedule_return_pickup")
+async def schedule_return_pickup_tool(
+    order_id: str, pickup_date: str, ctx: Context = None
+) -> dict:
+    return await _tools.schedule_return_pickup(order_id=order_id, pickup_date=pickup_date, ctx=ctx)
+
+# ── Escalation Tools ──────────────────────────────────────────────
 
 @mcp.tool(name="create_ticket", description="Create a new support ticket")
 @record_metrics("create_ticket")
 async def create_ticket_tool(
-    user_id: str, query_text: str, classification: dict, priority: str, ctx: Context = None
+    user_id: str,
+    query_text: str,
+    classification: dict,
+    priority: str,
+    assigned_team: str = "general_support",
+    ctx: Context = None,
 ) -> str:
     return await _tools.create_ticket(
-        user_id=user_id, query_text=query_text, classification=classification, priority=priority, ctx=ctx
+        user_id=user_id,
+        query_text=query_text,
+        classification=classification,
+        priority=priority,
+        assigned_team=assigned_team,
+        ctx=ctx,
     )
 
 
@@ -216,27 +218,23 @@ async def escalate_to_human_tool(ticket_id: str, ctx: Context = None) -> dict:
     return await _tools.escalate_to_human(ticket_id=ticket_id, ctx=ctx)
 
 
-@mcp.tool(name="process_auto_refund", description="Process an automatic refund for an order")
-@record_metrics("process_auto_refund")
-async def process_auto_refund_tool(order_id: str, ctx: Context = None) -> dict:
-    return await _tools.process_auto_refund(order_id=order_id, ctx=ctx)
+@mcp.tool(name="route_to_team", description="Assign a ticket to a specific team queue")
+@record_metrics("route_to_team")
+async def route_to_team_tool(ticket_id: str, team: str, ctx: Context = None) -> dict:
+    return await _tools.route_to_team(ticket_id=ticket_id, team=team, ctx=ctx)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # 6.  Health‑check endpoints via @mcp.custom_route
-#     Custom routes receive a Starlette Request — they do NOT have
-#     access to Context or ctx.lifespan_context.  Use module-level
-#     _pool instead.
 # ═══════════════════════════════════════════════════════════════════
 
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request: Request) -> PlainTextResponse:
-    """Liveness probe – returns 200 if the process is alive."""
     return PlainTextResponse("ok")
 
 
 @mcp.custom_route("/readyz", methods=["GET"])
 async def readyz(request: Request) -> PlainTextResponse:
-    """Readiness probe – verifies database connectivity."""
     if _pool is None:
         return PlainTextResponse("not ready: pool not initialised", status_code=503)
     try:
@@ -248,18 +246,17 @@ async def readyz(request: Request) -> PlainTextResponse:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 7.  Entrypoint
+# 7.  Entrypoint (HTTP transport, recommended)
 # ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     log.info(
-        "Starting mcp-server on %s:%s (transport=sse)",
+        "Starting mcp-server on %s:%s (transport=http)",
         settings.host,
         settings.port,
     )
-    
     mcp.run(
-        transport="sse",
+        transport="http",
         host=settings.host,
         port=settings.port,
         log_level=LOG_LEVEL.lower(),

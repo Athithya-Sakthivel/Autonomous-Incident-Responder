@@ -15,13 +15,11 @@ from qdrant_client import AsyncQdrantClient
 
 from config import settings
 
-# ── Module-level client (initialised once) ──────────────────────
 _client = AsyncQdrantClient(url=settings.qdrant_url)
 _http = httpx.AsyncClient(timeout=30.0)
 
 
 async def _embed_query(text: str) -> list[float]:
-    """Get embedding vector from the remote dense service."""
     resp = await _http.post(
         f"{settings.dense_url}/embed",
         json={"texts": [text]},
@@ -37,31 +35,18 @@ async def hybrid_search(
     query: str,
     top_k: int = 5,
 ) -> list[dict[str, Any]]:
-    """Search Qdrant for policy chunks matching the query.
-
-    Args:
-        query: Natural language query string.
-        top_k: Number of results to return.
-
-    Returns:
-        List of dicts with keys: text, score, metadata.
-    """
     vector = await _embed_query(query)
-
     results = await _client.query_points(
         collection_name=settings.qdrant_collection,
         query=vector,
         limit=top_k,
         with_payload=True,
     )
-
     return [
         {
             "text": point.payload.get("text", ""),
             "score": point.score,
-            "metadata": {
-                k: v for k, v in point.payload.items() if k != "text"
-            },
+            "metadata": {k: v for k, v in point.payload.items() if k != "text"},
         }
         for point in results.points
     ]

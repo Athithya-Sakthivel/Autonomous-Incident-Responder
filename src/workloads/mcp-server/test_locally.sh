@@ -4,8 +4,8 @@ set -euo pipefail
 # =============================================================================
 # MCP Server — Battle Test (Real SigNoz, Local Process)
 # =============================================================================
-# Tests all 8 MCP tools + OTel signals + context propagation.
-# Every check prints explicit values — never a binary pass/fail.
+# Tests all 10 MCP tools + OTel signals + context propagation.
+# Uses HTTP transport (/mcp) as recommended for new deployments.
 #
 # Requirements: kubectl, python3, curl, fastmcp
 # SigNoz, PostgreSQL, Qdrant, and dense-embedder already deployed
@@ -32,7 +32,7 @@ DENSE_PORT="${DENSE_PORT:-8200}"
 
 MCP_PORT="${MCP_PORT:-8001}"
 MCP_URL="http://127.0.0.1:${MCP_PORT}"
-MCP_SSE="${MCP_URL}/sse"
+MCP_HTTP="${MCP_URL}/mcp"          # HTTP transport (recommended)
 
 command -v kubectl  >/dev/null 2>&1 || { echo "[ERROR] kubectl not found"  >&2; exit 1; }
 command -v python3  >/dev/null 2>&1 || { echo "[ERROR] python3 not found"  >&2; exit 1; }
@@ -54,7 +54,7 @@ cleanup() {
   echo ""
   echo "[CLEANUP] Tearing down all port-forwards and processes..."
   kill -INT "${MCP_PID}" 2>/dev/null || true
-  sleep 3  # Wait for graceful shutdown + force_flush of telemetry
+  sleep 3
   kill "${PF_COLLECTOR}"  2>/dev/null || true
   kill "${PF_CLICKHOUSE}" 2>/dev/null || true
   kill "${PF_POSTGRES}"   2>/dev/null || true
@@ -102,11 +102,34 @@ except Exception:
 }
 
 # =============================================================================
-# STEP 1: Port-forward all dependencies
+# STEP 1: Kill any stale PostgreSQL port-forwards and restart
 # =============================================================================
 echo ""
 echo "=============================================================================="
-echo "[STEP 1/10] Port-forwarding SigNoz, PostgreSQL, Qdrant, Dense..."
+echo "[STEP 1/10] Ensuring PostgreSQL port-forward is fresh..."
+echo "=============================================================================="
+pkill -f "port-forward.*5432" 2>/dev/null || true
+sleep 1
+kubectl port-forward -n "${POSTGRES_NAMESPACE}" svc/"${POSTGRES_SVC}" \
+  "${POSTGRES_PORT}:5432" >/tmp/pf-postgres.log 2>&1 &
+PF_POSTGRES=$!
+echo "  PostgreSQL :${POSTGRES_PORT} (PID ${PF_POSTGRES})"
+
+echo "  Waiting for PostgreSQL port to become reachable..."
+for ((i=0; i<20; i++)); do
+  if timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${POSTGRES_PORT}" 2>/dev/null; then
+    echo "  PostgreSQL reachable"
+    break
+  fi
+  sleep 1
+done
+
+# =============================================================================
+# STEP 2: Port-forward all other dependencies
+# =============================================================================
+echo ""
+echo "=============================================================================="
+echo "[STEP 2/10] Port-forwarding SigNoz, Qdrant, Dense..."
 echo "=============================================================================="
 
 kubectl port-forward -n "${SIGNOZ_NAMESPACE}" svc/"${COLLECTOR_SVC}" \
@@ -119,11 +142,6 @@ kubectl port-forward -n "${SIGNOZ_NAMESPACE}" svc/"${CLICKHOUSE_SVC}" \
 PF_CLICKHOUSE=$!
 echo "  ClickHouse :${CLICKHOUSE_PORT} (PID ${PF_CLICKHOUSE})"
 
-kubectl port-forward -n "${POSTGRES_NAMESPACE}" svc/"${POSTGRES_SVC}" \
-  "${POSTGRES_PORT}:5432" >/tmp/pf-postgres.log 2>&1 &
-PF_POSTGRES=$!
-echo "  PostgreSQL :${POSTGRES_PORT} (PID ${PF_POSTGRES})"
-
 kubectl port-forward -n "${QDRANT_NAMESPACE}" svc/"${QDRANT_SVC}" \
   "${QDRANT_PORT}:6333" >/tmp/pf-qdrant.log 2>&1 &
 PF_QDRANT=$!
@@ -134,14 +152,13 @@ kubectl port-forward -n "${DENSE_NAMESPACE}" svc/"${DENSE_SVC}" \
 PF_DENSE=$!
 echo "  Dense :${DENSE_PORT} (PID ${PF_DENSE})"
 
-echo "  Waiting for all 5 ports to become reachable..."
+echo "  Waiting for all 4 ports to become reachable..."
 for ((i=0; i<30; i++)); do
   if timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${COLLECTOR_PORT}" 2>/dev/null && \
      timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${CLICKHOUSE_PORT}" 2>/dev/null && \
-     timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${POSTGRES_PORT}" 2>/dev/null && \
      timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${QDRANT_PORT}" 2>/dev/null && \
      timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${DENSE_PORT}" 2>/dev/null; then
-    echo "  All 5 ports reachable"
+    echo "  All 4 ports reachable"
     break
   fi
   sleep 1
@@ -162,14 +179,13 @@ if [[ "${LOGS_TABLE}" != "1" || "${SPANS_TABLE}" != "1" || "${METRICS_TABLE}" !=
 fi
 
 # =============================================================================
-# STEP 2: Start MCP server as a local process
+# STEP 3: Start MCP server as a local process
 # =============================================================================
 echo ""
 echo "=============================================================================="
-echo "[STEP 2/10] Starting mcp-server as local process..."
+echo "[STEP 3/10] Starting mcp-server as local process..."
 echo "=============================================================================="
 
-# Ensure virtual environment exists and dependencies are installed
 if [ ! -d .venv ]; then
   echo "  Creating virtual environment..."
   python3 -m venv .venv
@@ -207,10 +223,10 @@ MCP_PID=$!
 echo "  Process PID                = ${MCP_PID}"
 
 # =============================================================================
-# STEP 3: Wait for readiness
+# STEP 4: Wait for readiness
 # =============================================================================
 echo ""
-echo "[STEP 3/10] Waiting for readiness..."
+echo "[STEP 4/10] Waiting for readiness..."
 READY=0
 for ((i=0; i<30; i++)); do
   if READYZ=$(curl -fsS --max-time 2 "${MCP_URL}/readyz" 2>/dev/null); then
@@ -223,7 +239,6 @@ done
 
 if [[ ${READY} -eq 0 ]]; then
   echo "[FATAL] Server did not become ready within 30 seconds"
-  echo "  Last 20 lines of /tmp/mcp-server.log:"
   tail -20 /tmp/mcp-server.log
   exit 1
 fi
@@ -244,11 +259,11 @@ TEST_START_EPOCH_NS=$(python3 -c "import time; print(int(time.time() * 1e9))")
 sleep 1
 
 # =============================================================================
-# STEP 4: Test all 8 MCP tools
+# STEP 5: Test all 10 MCP tools
 # =============================================================================
 echo ""
 echo "=============================================================================="
-echo "[STEP 4/10] Testing all 8 MCP tools..."
+echo "[STEP 5/10] Testing all 10 MCP tools..."
 echo "=============================================================================="
 
 run_tool() {
@@ -259,16 +274,13 @@ run_tool() {
   echo "  Description: ${desc}"
   echo "  Arguments:   $*"
 
-  # Capture output, filter known warnings
   local OUTPUT
-  OUTPUT=$(fastmcp call "${MCP_SSE}" "${tool}" "$@" 2>&1 | grep -v "UserWarning\|oauth.py\|site-packages\|/fastmcp/client/auth/" || true)
+  OUTPUT=$(fastmcp call "${MCP_HTTP}" "${tool}" "$@" 2>&1 | grep -v "UserWarning\|oauth.py\|site-packages\|/fastmcp/client/auth/" || true)
 
-  # Display the raw response (truncated to 500 chars for readability)
   echo "  Response:"
   echo "${OUTPUT}" | head -30 | sed 's/^/    /'
 
-  # Determine pass/fail based on expected keys
-  if echo "${OUTPUT}" | grep -qE '"result"|"eligible"|"status"|"refund_id"'; then
+  if echo "${OUTPUT}" | grep -qE '"result"|"eligible"|"status"|"transaction_id"|"refund_id"'; then
     record_pass "${tool}" "Returned expected keys"
   elif echo "${OUTPUT}" | grep -qi "error"; then
     record_fail "${tool}" "Tool returned an error — see response above"
@@ -277,7 +289,7 @@ run_tool() {
   fi
 }
 
-# --- Context tools (read-only, use real seed data IDs) ---
+# --- Context tools (read-only) ---
 run_tool "lookup_customer" \
   "Find customer by email address" \
   email=priya.sharma@email.com
@@ -294,56 +306,70 @@ run_tool "check_refund_eligibility" \
   "Check whether an order is eligible for refund" \
   order_id=c3d4e5f6-a7b8-4c9d-0e1f-000000000004
 
-# --- Ops tools ---
 run_tool "search_policies" \
   "Search company policies using semantic search" \
   query="return policy for damaged phone"
 
+# --- Action tools (write) ---
+run_tool "issue_wallet_credit" \
+  "Issue wallet credit to a customer (max Rs.500)" \
+  user_id=a1b2c3d4-e5f6-4a7b-8c9d-000000000001 \
+  amount=100.0 \
+  reason="Battle test compensation"
+
+run_tool "schedule_return_pickup" \
+  "Schedule a return pickup for an eligible order" \
+  order_id=c3d4e5f6-a7b8-4c9d-0e1f-000000000001 \
+  pickup_date="2026-06-01"
+
+# --- Escalation tools ---
 run_tool "create_ticket" \
   "Create a new support ticket" \
   user_id=a1b2c3d4-e5f6-4a7b-8c9d-000000000001 \
   query_text="Test ticket from battle test" \
   classification='{"intent":"test","urgency":5,"sentiment":"neutral","auto_resolvable":true}' \
-  priority=medium
+  priority=medium \
+  assigned_team=general_support
 
 run_tool "escalate_to_human" \
   "Escalate a ticket to a human agent" \
   ticket_id=e5f6a7b8-c9d0-4e1f-2a3b-000000000001
 
-run_tool "process_auto_refund" \
-  "Process an automatic refund for an order" \
-  order_id=c3d4e5f6-a7b8-4c9d-0e1f-000000000001
+run_tool "route_to_team" \
+  "Assign a ticket to a specific team queue" \
+  ticket_id=e5f6a7b8-c9d0-4e1f-2a3b-000000000001 \
+  team=payments
 
 # =============================================================================
-# STEP 5: Verify tool registration count
+# STEP 6: Verify tool registration count
 # =============================================================================
 echo ""
-echo "[STEP 5/10] Listing registered tools..."
-TOOL_LIST=$(fastmcp list "${MCP_SSE}" 2>&1 | grep -v "UserWarning\|oauth.py\|site-packages\|/fastmcp/client/auth/" || true)
+echo "[STEP 6/10] Listing registered tools..."
+TOOL_LIST=$(fastmcp list "${MCP_HTTP}" 2>&1 | grep -v "UserWarning\|oauth.py\|site-packages\|/fastmcp/client/auth/" || true)
 echo "${TOOL_LIST}"
 TOOL_COUNT=$(echo "${TOOL_LIST}" | grep -cE "^\s+[a-z_]+" || true)
 echo "  Tools registered: ${TOOL_COUNT}"
-if [[ "${TOOL_COUNT}" -eq 8 ]]; then
-  record_pass "8 tools registered" "All 8 tools present"
+if [[ "${TOOL_COUNT}" -eq 10 ]]; then
+  record_pass "10 tools registered" "All 10 tools present"
 else
-  record_fail "8 tools registered" "Found ${TOOL_COUNT}, expected 8"
+  record_fail "10 tools registered" "Found ${TOOL_COUNT}, expected 10"
 fi
 
 # =============================================================================
-# STEP 6: Wait for SigNoz ingestion into ClickHouse
+# STEP 7: Wait for SigNoz ingestion into ClickHouse
 # =============================================================================
 echo ""
-echo "[STEP 6/10] Waiting for SigNoz to ingest telemetry into ClickHouse (15s)..."
+echo "[STEP 7/10] Waiting for SigNoz to ingest telemetry into ClickHouse (15s)..."
 sleep 15
 
 TEST_END_EPOCH_NS=$(( $(python3 -c "import time; print(int(time.time() * 1e9))") + 30000000000 ))
 
 # =============================================================================
-# STEP 7: Query ClickHouse for traces, metrics, and logs
+# STEP 8: Query ClickHouse for traces, metrics, and logs
 # =============================================================================
 echo ""
 echo "=============================================================================="
-echo "[STEP 7/10] Querying ClickHouse for traces, metrics, and logs..."
+echo "[STEP 8/10] Querying ClickHouse for traces, metrics, and logs..."
 echo "=============================================================================="
 
 TIMESTAMP_START="${TEST_START_EPOCH_NS}"
@@ -370,11 +396,11 @@ WHERE resources_string['service.name'] = 'mcp-server'
   AND body LIKE '%Tool call started%'
 ")
 echo "  Log lines matching 'Tool call started': ${LOG_COUNT}"
-echo "  Expected: >= 8 (one per tool call)"
-if [[ "${LOG_COUNT}" -ge 8 ]]; then
-  record_pass "Application logs exported to SigNoz" "${LOG_COUNT} lines found (>=8 expected)"
+echo "  Expected: >= 10 (one per tool call)"
+if [[ "${LOG_COUNT}" -ge 10 ]]; then
+  record_pass "Application logs exported to SigNoz" "${LOG_COUNT} lines found (>=10 expected)"
 else
-  record_fail "Application logs exported to SigNoz" "Found ${LOG_COUNT}, expected >=8"
+  record_fail "Application logs exported to SigNoz" "Found ${LOG_COUNT}, expected >=10"
 fi
 
 # --- Check 2: Distributed Traces ---
@@ -386,11 +412,11 @@ FROM signoz_traces.distributed_signoz_index_v3
 WHERE trace_id IN (${TRACE_IDS_SUBQUERY})
 ")
 echo "  Spans correlated with our log trace_ids: ${SPAN_COUNT}"
-echo "  Expected: >= 16 (8 tool SERVER spans + child spans for PostgreSQL + Qdrant)"
-if [[ "${SPAN_COUNT}" -ge 16 ]]; then
-  record_pass "Traces exported to ClickHouse" "${SPAN_COUNT} spans found (>=16 expected)"
+echo "  Expected: >= 20 (10 tool SERVER spans + child spans for PostgreSQL + Qdrant)"
+if [[ "${SPAN_COUNT}" -ge 20 ]]; then
+  record_pass "Traces exported to ClickHouse" "${SPAN_COUNT} spans found (>=20 expected)"
 else
-  record_fail "Traces exported to ClickHouse" "Found ${SPAN_COUNT}, expected >=16"
+  record_fail "Traces exported to ClickHouse" "Found ${SPAN_COUNT}, expected >=20"
 fi
 
 # --- Check 3: Child Spans (PostgreSQL) ---
@@ -403,11 +429,11 @@ WHERE name LIKE 'postgres %'
   AND trace_id IN (${TRACE_IDS_SUBQUERY})
 ")
 echo "  'postgres *' child spans: ${PG_SPAN_COUNT}"
-echo "  Expected: >= 6 (lookup_customer, get_recent_orders, get_order_details, check_refund_eligibility, create_ticket, escalate_to_human)"
-if [[ "${PG_SPAN_COUNT}" -ge 6 ]]; then
-  record_pass "Child spans: PostgreSQL queries" "${PG_SPAN_COUNT} spans (>=6 expected)"
+echo "  Expected: >= 9 (lookup_customer, get_recent_orders, get_order_details, check_refund_eligibility, create_ticket, escalate_to_human, route_to_team, issue_wallet_credit, schedule_return_pickup)"
+if [[ "${PG_SPAN_COUNT}" -ge 9 ]]; then
+  record_pass "Child spans: PostgreSQL queries" "${PG_SPAN_COUNT} spans (>=9 expected)"
 else
-  record_fail "Child spans: PostgreSQL queries" "Found ${PG_SPAN_COUNT}, expected >=6"
+  record_fail "Child spans: PostgreSQL queries" "Found ${PG_SPAN_COUNT}, expected >=9"
 fi
 
 # --- Check 4: Child Spans (Qdrant) ---
@@ -457,33 +483,31 @@ WHERE resources_string['service.name'] = 'mcp-server'
   AND body LIKE '%Tool call started%'
 ")
 echo "  Log lines with a non-empty trace_id: ${LOG_WITH_TRACE}"
-echo "  Expected: >= 8 (one correlated log per tool call)"
-if [[ "${LOG_WITH_TRACE}" -ge 8 ]]; then
-  record_pass "Log-Trace correlation" "${LOG_WITH_TRACE} correlated lines found (>=8 expected)"
+echo "  Expected: >= 10 (one correlated log per tool call)"
+if [[ "${LOG_WITH_TRACE}" -ge 10 ]]; then
+  record_pass "Log-Trace correlation" "${LOG_WITH_TRACE} correlated lines found (>=10 expected)"
 else
-  record_fail "Log-Trace correlation" "Found ${LOG_WITH_TRACE}, expected >=8"
+  record_fail "Log-Trace correlation" "Found ${LOG_WITH_TRACE}, expected >=10"
 fi
 
 # =============================================================================
-# STEP 8: Local process checks
+# STEP 9: Local process checks
 # =============================================================================
 echo ""
-echo "[STEP 8/10] Local process checks..."
+echo "[STEP 9/10] Local process checks..."
 MCP_LOG=$(cat /tmp/mcp-server.log 2>/dev/null || echo "")
 
-# --- Check 7: Process stdout ---
 echo ""
 echo "  ---- Check 7: Process stdout ----"
 COMPLETED_LINES=$(echo "${MCP_LOG}" | grep -c "Tool call started" || echo 0)
 echo "  'Tool call started' lines in local log: ${COMPLETED_LINES}"
-echo "  Expected: >= 8"
-if [[ "${COMPLETED_LINES}" -ge 8 ]]; then
-  record_pass "Local stdout (Tool call started)" "${COMPLETED_LINES} lines (>=8 expected)"
+echo "  Expected: >= 10"
+if [[ "${COMPLETED_LINES}" -ge 10 ]]; then
+  record_pass "Local stdout (Tool call started)" "${COMPLETED_LINES} lines (>=10 expected)"
 else
-  record_fail "Local stdout (Tool call started)" "Found ${COMPLETED_LINES}, expected >=8"
+  record_fail "Local stdout (Tool call started)" "Found ${COMPLETED_LINES}, expected >=10"
 fi
 
-# --- Check 8: OTLP export errors ---
 echo ""
 echo "  ---- Check 8: OTLP export errors ----"
 OTLP_ERRORS=$(echo "${MCP_LOG}" | grep -cE "Failed to export|StatusCode\\.UNAVAILABLE" 2>/dev/null || echo 0)
@@ -496,7 +520,6 @@ else
   record_fail "OTLP export (no errors)" "${OTLP_ERRORS} errors found — check collector connectivity"
 fi
 
-# --- Check 9: Health endpoints ---
 echo ""
 echo "  ---- Check 9: Health endpoints ----"
 HEALTHZ=$(curl -fsS --max-time 2 "${MCP_URL}/healthz" 2>/dev/null || echo "FAIL")
@@ -516,10 +539,12 @@ else
 fi
 
 # =============================================================================
-# STEP 9: Cross-service trace verification
+# STEP 10: Cross-service trace verification + Final report
 # =============================================================================
 echo ""
-echo "[STEP 9/10] Cross-service trace verification..."
+echo "=============================================================================="
+echo "[STEP 10/10] Cross-service trace verification + Summary..."
+echo "=============================================================================="
 
 TRACE_ID=$(ch_query "
 SELECT trace_id
@@ -534,7 +559,6 @@ LIMIT 1
 if [[ -n "${TRACE_ID}" ]]; then
   echo "  Sample Trace ID: ${TRACE_ID}"
 
-  # List all services that participated in this trace
   SERVICES=$(ch_query "
 SELECT DISTINCT resources_string['service.name'] AS svc
 FROM signoz_traces.distributed_signoz_index_v3
@@ -554,13 +578,6 @@ else
   record_fail "Trace context propagation" "No trace_id found in log records"
 fi
 
-# =============================================================================
-# STEP 10: Final report
-# =============================================================================
-echo ""
-echo "=============================================================================="
-echo "[STEP 10/10] Battle Test Summary — mcp-server"
-echo "=============================================================================="
 echo ""
 echo "  Results:"
 for result in "${RESULTS[@]}"; do
@@ -585,6 +602,6 @@ else
   echo "  Debugging tips:"
   echo "    Server logs : cat /tmp/mcp-server.log"
   echo "    Collector   : kubectl logs -n signoz deployment/signoz-otel-collector --tail=50"
-  echo "    Manual test : fastmcp call http://localhost:8001/sse lookup_customer email=priya.sharma@email.com"
+  echo "    Manual test : fastmcp call http://localhost:8001/mcp lookup_customer email=priya.sharma@email.com"
   exit 1
 fi

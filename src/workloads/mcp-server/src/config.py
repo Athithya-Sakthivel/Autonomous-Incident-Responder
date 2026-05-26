@@ -19,16 +19,11 @@ class Settings(BaseSettings):
 
     # ── PostgreSQL (via CloudNative PG PgBouncer pooler) ──────────
     database_url: str = (
-        "postgresql://"
+        "postgresql://app:password@postgres-pooler.default.svc.cluster.local:5432/agents_state"
     )
     pool_min_size: int = 5
     pool_max_size: int = 25
     pool_command_timeout: float = 10.0
-
-    # ── Retriever service ────────────────────────────────────────
-    retriever_url: str = (
-        "http://retriever-minimal-svc.inference.svc.cluster.local:8001"
-    )
 
     # ── Dense embedding service ──────────────────────────────────
     dense_url: str = "http://dense-svc.inference.svc.cluster.local:8200"

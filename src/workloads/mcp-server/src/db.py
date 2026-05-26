@@ -5,12 +5,13 @@ Designed for PgBouncer transaction mode:
 - No session-level features (SET, LISTEN, temporary tables).
 - Every query runs in its own transaction.
 
-Includes both read queries (context tools) and write queries (ops tools).
+Includes read queries (context tools) and write queries (ops tools).
 """
 
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any
 
 import asyncpg
@@ -113,57 +114,37 @@ async def get_billing_by_order(
 # ═══════════════════════════════════════════════════════════════════
 # WRITE QUERIES — Ops Tools
 # ═══════════════════════════════════════════════════════════════════
+
 async def insert_ticket(
     pool: asyncpg.Pool,
     user_id: str,
     query_text: str,
     classification: dict,
     priority: str,
+    assigned_team: str = "general_support",
 ) -> str:
-    """Create a new ticket."""
-
+    """Create a new ticket. Returns the ticket UUID."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
-                """
-                INSERT INTO tickets (
-                    id,
-                    user_id,
-                    query_text,
-                    classification,
-                    resolution_type,
-                    status,
-                    priority,
-                    source,
-                    created_at,
-                    updated_at
-                )
-                VALUES (
-                    gen_random_uuid(),
-                    $1,
-                    $2,
-                    $3::jsonb,
-                    'escalated',
-                    'pending_human',
-                    $4,
-                    'chat',
-                    NOW(),
-                    NOW()
-                )
-                RETURNING id
-                """,
+                """INSERT INTO tickets
+                   (id, user_id, query_text, classification, resolution_type, status,
+                    priority, assigned_team, source, created_at, updated_at)
+                   VALUES (gen_random_uuid(), $1, $2, $3::jsonb, 'escalated', 'pending_human',
+                           $4, $5, 'chat', NOW(), NOW())
+                   RETURNING id""",
                 user_id,
                 query_text,
                 json.dumps(classification),
                 priority,
+                assigned_team,
             )
-
     return str(row["id"])
+
 
 async def update_ticket_status(
     pool: asyncpg.Pool, ticket_id: str, status: str
 ) -> None:
-    """Update ticket status."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute(
@@ -176,7 +157,6 @@ async def update_ticket_status(
 async def set_ticket_priority(
     pool: asyncpg.Pool, ticket_id: str, priority: str
 ) -> None:
-    """Update ticket priority."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute(
@@ -186,10 +166,22 @@ async def set_ticket_priority(
             )
 
 
-async def process_refund(
-    pool: asyncpg.Pool, order_id: str, amount: float
+async def assign_ticket_team(
+    pool: asyncpg.Pool, ticket_id: str, team: str
+) -> None:
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE tickets SET assigned_team = $1, updated_at = NOW() WHERE id = $2",
+                team,
+                ticket_id,
+            )
+
+
+async def issue_wallet_credit(
+    pool: asyncpg.Pool, user_id: str, amount: Decimal, reason: str
 ) -> str:
-    """Record a refund in the billing table. Returns the refund transaction ID."""
+    """Record a wallet credit and return its transaction ID."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
@@ -197,12 +189,24 @@ async def process_refund(
                    (id, order_id, user_id, transaction_type, amount, status,
                     refund_eligible, refund_reason, payment_gateway,
                     gateway_transaction_id, transaction_date, completed_date)
-                   SELECT gen_random_uuid(), id, user_id, 'refund', $1, 'completed',
-                          false, 'auto_refund', 'kestral_wallet',
-                          'R-' || substr(gen_random_uuid()::text, 1, 8), NOW(), NOW()
-                   FROM orders WHERE id = $2
+                   VALUES (gen_random_uuid(), NULL, $1, 'wallet_credit', $2, 'completed',
+                           false, $3, 'kestral_wallet',
+                           'WC-' || substr(gen_random_uuid()::text, 1, 8), NOW(), NOW())
                    RETURNING gateway_transaction_id""",
+                user_id,
                 amount,
-                order_id,
+                reason,
             )
     return str(row["gateway_transaction_id"])
+
+
+async def schedule_return_pickup(
+    pool: asyncpg.Pool, order_id: str, pickup_date: str
+) -> None:
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE orders SET status = 'return_initiated', notes = COALESCE(notes, '') || ' Return pickup: ' || $2 WHERE id = $1",
+                order_id,
+                pickup_date,
+            )
