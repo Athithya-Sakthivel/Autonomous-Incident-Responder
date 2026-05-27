@@ -38,6 +38,9 @@ command -v kubectl  >/dev/null 2>&1 || { echo "[ERROR] kubectl not found"  >&2; 
 command -v python3  >/dev/null 2>&1 || { echo "[ERROR] python3 not found"  >&2; exit 1; }
 command -v curl     >/dev/null 2>&1 || { echo "[ERROR] curl not found"     >&2; exit 1; }
 
+source .venv/bin/activate
+command -v websocat >/dev/null 2>&1 || { echo "[ERROR] websocat not found" >&2; exit 1; }
+
 # --- Helper: kill any port-forward on a specific port by matching command line --
 kill_port_forward_on_port() {
   local port="$1"
