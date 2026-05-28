@@ -41,14 +41,6 @@ command -v curl     >/dev/null 2>&1 || { echo "[ERROR] curl not found"     >&2; 
 source .venv/bin/activate
 command -v websocat >/dev/null 2>&1 || { echo "[ERROR] websocat not found" >&2; exit 1; }
 
-# --- Helper: kill any port-forward on a specific port by matching command line --
-kill_port_forward_on_port() {
-  local port="$1"
-  echo "  Killing existing port-forward on port ${port} (if any) ..."
-  pkill -f "kubectl port-forward.*${port}" 2>/dev/null || true
-  sleep 1
-}
-
 # --- Global state ----------------------------------------------------------
 PF_PIDS=()           # PIDs of our own port-forwards
 AGENT_PID=""
@@ -104,25 +96,21 @@ except Exception:
   fi
 }
 
-# =============================================================================
-# STEP 1: Clean previous forwards on our ports, then start new ones
-# =============================================================================
-echo ""
-echo "=============================================================================="
-echo "[STEP 1/10] Setting up fresh port-forwards ..."
-echo "=============================================================================="
-
-for port in "${COLLECTOR_PORT}" "${CLICKHOUSE_PORT}" "${POSTGRES_PORT}" "${QDRANT_PORT}" "${DENSE_PORT}" "${MCP_PORT}"; do
-  kill_port_forward_on_port "${port}"
-done
-
+# --- Idempotent port-forward helper (no killing of existing forwards) -------
 start_forward() {
   local name="$1" namespace="$2" svc="$3" local_port="$4" remote_port="$5"
+  
+  # If port is already listening, reuse it
+  if timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${local_port}" 2>/dev/null; then
+    echo "  ${name} port ${local_port} already in use – reusing"
+    return 0
+  fi
+  
   echo "  Starting ${name} forward ${local_port} -> ${remote_port} ..."
   kubectl port-forward -n "${namespace}" svc/"${svc}" "${local_port}:${remote_port}" >/tmp/pf-${name}.log 2>&1 &
   local pid=$!
   PF_PIDS+=("${pid}")
-  # Wait until the port is actually listening
+  
   for ((i=0; i<20; i++)); do
     if timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${local_port}" 2>/dev/null; then
       echo "    ${name} ready (PID ${pid})"
@@ -134,14 +122,21 @@ start_forward() {
   return 1
 }
 
-start_forward "collector"   "${SIGNOZ_NAMESPACE}"   "${COLLECTOR_SVC}"   "${COLLECTOR_PORT}"   4317
-start_forward "clickhouse"  "${SIGNOZ_NAMESPACE}"   "${CLICKHOUSE_SVC}"  "${CLICKHOUSE_PORT}"  8123
-start_forward "postgres"    "${POSTGRES_NAMESPACE}" "${POSTGRES_SVC}"    "${POSTGRES_PORT}"    5432
-start_forward "qdrant"      "${QDRANT_NAMESPACE}"   "${QDRANT_SVC}"      "${QDRANT_PORT}"      6333
-start_forward "dense"       "${DENSE_NAMESPACE}"    "${DENSE_SVC}"       "${DENSE_PORT}"       8200
-start_forward "mcp"         "${MCP_NAMESPACE}"      "${MCP_SVC}"         "${MCP_PORT}"         8001
+# =============================================================================
+# STEP 1: Start port-forwards idempotently
+# =============================================================================
+echo ""
+echo "=============================================================================="
+echo "[STEP 1/10] Setting up fresh port-forwards ..."
+echo "=============================================================================="
 
-# Give everything a moment to settle
+start_forward "collector"   "${SIGNOZ_NAMESPACE}"   "${COLLECTOR_SVC}"   "${COLLECTOR_PORT}"   4317 || exit 1
+start_forward "clickhouse"  "${SIGNOZ_NAMESPACE}"   "${CLICKHOUSE_SVC}"  "${CLICKHOUSE_PORT}"  8123 || exit 1
+start_forward "postgres"    "${POSTGRES_NAMESPACE}" "${POSTGRES_SVC}"    "${POSTGRES_PORT}"    5432 || exit 1
+start_forward "qdrant"      "${QDRANT_NAMESPACE}"   "${QDRANT_SVC}"      "${QDRANT_PORT}"      6333 || exit 1
+start_forward "dense"       "${DENSE_NAMESPACE}"    "${DENSE_SVC}"       "${DENSE_PORT}"       8200 || exit 1
+start_forward "mcp"         "${MCP_NAMESPACE}"      "${MCP_SVC}"         "${MCP_PORT}"         8001 || exit 1
+
 sleep 2
 
 # Verify ClickHouse tables
@@ -176,24 +171,8 @@ export DATABASE_URL="postgresql://app:${PGPASSWORD}@127.0.0.1:${POSTGRES_PORT}/a
 export LLM_API_KEY="${GROQ_API_KEY:-}"
 export MCP_SERVER_URL="http://127.0.0.1:${MCP_PORT}/mcp"
 
-# Determine OTLP endpoint – try local forward first, then ClusterIP
-OTLP_ENDPOINT="http://127.0.0.1:${COLLECTOR_PORT}"
-if ! timeout 2 bash -c "echo >/dev/tcp/127.0.0.1/${COLLECTOR_PORT}" 2>/dev/null; then
-  COLLECTOR_IP=$(kubectl get svc "${COLLECTOR_SVC}" -n "${SIGNOZ_NAMESPACE}" -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
-  if [ -n "${COLLECTOR_IP}" ]; then
-    OTLP_ENDPOINT="http://${COLLECTOR_IP}:4317"
-    echo "  Local collector forward not reachable, trying ClusterIP ${OTLP_ENDPOINT} ..."
-    if ! timeout 2 bash -c "echo >/dev/tcp/${COLLECTOR_IP}/4317" 2>/dev/null; then
-      echo "  [WARN] Collector ClusterIP also unreachable. Telemetry export may fail."
-    fi
-  else
-    echo "  [WARN] Cannot determine collector address. Telemetry export will likely fail."
-  fi
-else
-  echo "  Using local collector forward at ${OTLP_ENDPOINT}"
-fi
-
-export OTEL_EXPORTER_OTLP_ENDPOINT="${OTLP_ENDPOINT}"
+# OTel endpoint – gRPC exporter expects "http://host:port"
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:${COLLECTOR_PORT}"
 export OTEL_EXPORTER_OTLP_INSECURE="true"
 export OTEL_SERVICE_NAME="agent-service"
 export OTEL_LOG_LEVEL="INFO"
@@ -204,7 +183,7 @@ export SERVICE_VERSION="0.1.0"
 export LOG_LEVEL="INFO"
 export PORT="${AGENT_PORT}"
 export DSPY_COMPILED_DIR="compiled"
-
+  
 echo "  MCP_SERVER_URL = ${MCP_SERVER_URL}"
 echo "  OTEL_EXPORTER_OTLP_ENDPOINT = ${OTEL_EXPORTER_OTLP_ENDPOINT}"
 echo "  DATABASE_URL = postgresql://app:***@127.0.0.1:${POSTGRES_PORT}/agents_state"

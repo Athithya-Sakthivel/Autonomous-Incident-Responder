@@ -47,13 +47,13 @@ class MCPClientManager:
             result = await tool.ainvoke(arguments)
             # Normalise any LangChain ToolMessage to a plain string
             if hasattr(result, "content"):
-                c = result.content
-                if isinstance(c, list) and len(c) > 0:
-                    fst = c[0]
-                    if hasattr(fst, "text"):
-                        return fst.text
-                    return str(fst)
-                return c
+                content = result.content
+                if isinstance(content, list) and len(content) > 0:
+                    first = content[0]
+                    if hasattr(first, "text"):
+                        return first.text
+                    return str(first)
+                return content
             return result
         except Exception:
             log.exception("MCP tool call failed: %s", name)
